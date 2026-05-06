@@ -31,6 +31,14 @@ pub enum SymbolKind {
 
 const BUILTIN_TYPE_NAMES: &[&str] = &["bitstring", "channel", "bool", "nat"];
 const BUILTIN_FUNCTION_NAMES: &[&str] = &["true", "false", "not"];
+const FREE_NAME_OPTION_NAMES: &[&str] = &["private"];
+const PROCESS_IO_OPTION_NAMES: &[&str] = &["precise"];
+const QUERY_SECRET_OPTION_NAMES: &[&str] = &[
+    "reachability",
+    "pv_reachability",
+    "real_or_random",
+    "pv_real_or_random",
+];
 
 pub struct ParsedDocument {
     tree: Tree,
@@ -125,7 +133,6 @@ impl ParsedDocument {
         let prefix = completion_prefix(&self.source, position).unwrap_or_default();
         let mut labels = HashSet::new();
         let mut items = Vec::new();
-        let mut expects_identifier = false;
 
         if let Some(node) = self.node_at(position) {
             let state = offset_for_position(&self.source, position)
@@ -140,7 +147,6 @@ impl ParsedDocument {
             if let Some(mut lookahead) = language().lookahead_iterator(state) {
                 for symbol_name in lookahead.iter_names() {
                     if symbol_name == "identifier" {
-                        expects_identifier = true;
                         continue;
                     }
                     if !KEYWORD_CANDIDATES.contains(&symbol_name) {
@@ -158,18 +164,28 @@ impl ParsedDocument {
             }
         }
 
-        if expects_identifier || should_offer_named_symbols(&prefix) {
-            for (name, kind) in self.completion_symbol_entries() {
-                if !matches_prefix(&name, &prefix) || !labels.insert(name.clone()) {
-                    continue;
-                }
-                items.push(CompletionItem {
-                    label: name,
-                    kind: Some(completion_kind_for_symbol(kind)),
-                    detail: Some(completion_detail_for_symbol(kind).to_owned()),
-                    ..CompletionItem::default()
-                });
+        for option in self.option_candidates_at_position(position) {
+            if !matches_prefix(option, &prefix) || !labels.insert(option.to_owned()) {
+                continue;
             }
+            items.push(CompletionItem {
+                label: option.to_owned(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("option".to_owned()),
+                ..CompletionItem::default()
+            });
+        }
+
+        for (name, kind, detail) in self.completion_symbol_entries() {
+            if !matches_prefix(&name, &prefix) || !labels.insert(name.clone()) {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(kind),
+                detail: Some(detail.to_owned()),
+                ..CompletionItem::default()
+            });
         }
 
         if items.is_empty() {
@@ -193,24 +209,70 @@ impl ParsedDocument {
         items
     }
 
-    fn completion_symbol_entries(&self) -> Vec<(String, SymbolKind)> {
+    fn option_candidates_at_position(&self, position: Position) -> Vec<&'static str> {
+        let Some(mut node) = self.node_at(position) else {
+            return Vec::new();
+        };
+        loop {
+            if node.kind() == "options" {
+                let Some(owner) = node.parent() else {
+                    return Vec::new();
+                };
+                return option_policy_for_owner(owner, &self.source)
+                    .map(|policy| policy.candidates().to_vec())
+                    .unwrap_or_default();
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+        Vec::new()
+    }
+
+    fn completion_symbol_entries(&self) -> Vec<(String, CompletionItemKind, &'static str)> {
         let mut entries = Vec::new();
         let mut labels = HashSet::new();
         let globals = self.globals_for_completion();
 
         for name in globals.types {
             if labels.insert(name.clone()) {
-                entries.push((name, SymbolKind::Type));
+                entries.push((name, CompletionItemKind::CLASS, "type"));
             }
         }
         for (name, _) in globals.functions {
             if labels.insert(name.clone()) {
-                entries.push((name, SymbolKind::Function));
+                entries.push((name, CompletionItemKind::FUNCTION, "function"));
+            }
+        }
+        for (name, _) in globals.events {
+            if labels.insert(name.clone()) {
+                entries.push((name, CompletionItemKind::FUNCTION, "event"));
+            }
+        }
+        for (name, _) in globals.predicates {
+            if labels.insert(name.clone()) {
+                entries.push((name, CompletionItemKind::FUNCTION, "predicate"));
+            }
+        }
+        for (name, _) in globals.tables {
+            if labels.insert(name.clone()) {
+                entries.push((name, CompletionItemKind::FUNCTION, "table"));
+            }
+        }
+        for (name, _) in globals.processes {
+            if labels.insert(name.clone()) {
+                entries.push((name, CompletionItemKind::FUNCTION, "process"));
             }
         }
         for (name, _) in globals.names {
             if labels.insert(name.clone()) {
-                entries.push((name, SymbolKind::Constant));
+                entries.push((name, CompletionItemKind::CONSTANT, "constant"));
+            }
+        }
+        for name in self.completion_variable_names() {
+            if labels.insert(name.clone()) {
+                entries.push((name, CompletionItemKind::VARIABLE, "variable"));
             }
         }
         for symbol in self
@@ -220,11 +282,46 @@ impl ParsedDocument {
             .filter(|symbol| symbol.kind == SymbolKind::Variable)
         {
             if labels.insert(symbol.name.clone()) {
-                entries.push((symbol.name, SymbolKind::Variable));
+                entries.push((symbol.name, CompletionItemKind::VARIABLE, "variable"));
             }
         }
 
         entries
+    }
+
+    fn completion_variable_names(&self) -> Vec<String> {
+        let query = match Query::new(
+            &language(),
+            r#"
+            (binding name: (identifier) @variable)
+            (new_binding name: (identifier) @variable)
+            (name_binding name: (identifier) @variable)
+            "#,
+        ) {
+            Ok(query) => query,
+            Err(_) => return Vec::new(),
+        };
+        let mut cursor = QueryCursor::new();
+        let capture_names = query.capture_names();
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut matches = cursor.matches(&query, self.tree.root_node(), self.source.as_bytes());
+        while let Some(query_match) = matches.next() {
+            for QueryCapture { node, index } in query_match.captures.iter().copied() {
+                if capture_names[index as usize] != "variable" {
+                    continue;
+                }
+                let Some(name) = node.utf8_text(self.source.as_bytes()).ok() else {
+                    continue;
+                };
+                if seen.insert(name.to_owned()) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+
+        names
     }
 
     fn globals_for_completion(&self) -> GlobalEnv {
@@ -304,6 +401,42 @@ enum IdentifierLookup {
     ZeroArgPredicate,
     Function { arity: usize },
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionPolicy {
+    FreeName,
+    ProcessInputGet,
+    QuerySecret,
+}
+
+impl OptionPolicy {
+    fn candidates(self) -> &'static [&'static str] {
+        match self {
+            OptionPolicy::FreeName => FREE_NAME_OPTION_NAMES,
+            OptionPolicy::ProcessInputGet => PROCESS_IO_OPTION_NAMES,
+            OptionPolicy::QuerySecret => QUERY_SECRET_OPTION_NAMES,
+        }
+    }
+
+    fn allows(self, name: &str) -> bool {
+        match self {
+            OptionPolicy::QuerySecret => {
+                QUERY_SECRET_OPTION_NAMES.contains(&name) || name.starts_with("cv_")
+            }
+            _ => self.candidates().contains(&name),
+        }
+    }
+
+    fn error_message(self) -> &'static str {
+        match self {
+            OptionPolicy::FreeName => "for free names, the only allowed option is private",
+            OptionPolicy::ProcessInputGet => {
+                "process input and get can only have \"precise\" as option"
+            }
+            OptionPolicy::QuerySecret => "the allowed options for query secret are reachability, pv_reachability, real_or_random, pv_real_or_random, and options starting with cv_",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -471,6 +604,7 @@ impl<'a> SemanticChecker<'a> {
                     if let Some(ty_node) = node.child_by_field_name("type") {
                         self.validate_type_nodes(ty_node);
                     }
+                    self.validate_options_for_owner(node);
                     self.validate_name_decl(node);
                     let ty = node
                         .child_by_field_name("type")
@@ -690,7 +824,7 @@ impl<'a> SemanticChecker<'a> {
                     if let Some(body) = node.child_by_field_name("body") {
                         self.check_special_query_forms(body, &env, false);
                     }
-                    self.check_query_decl_options(node);
+                    self.validate_options_for_owner(node);
                     if let Some(body) = node.child_by_field_name("body") {
                         if body.kind() == "query_sequence" {
                             for item in body.named_children(&mut body.walk()) {
@@ -928,6 +1062,7 @@ impl<'a> SemanticChecker<'a> {
                     self.check_term(channel, env);
                     self.check_expected_type(channel, env, "channel", "this term should have type channel");
                 }
+                self.validate_options_for_owner(node);
                 if let Some(pattern) = node.child_by_field_name("pattern") {
                     self.check_pattern_terms(pattern, env);
                 }
@@ -979,6 +1114,7 @@ impl<'a> SemanticChecker<'a> {
                     .child_by_field_name("patterns")
                     .map(collect_pattern_nodes)
                     .unwrap_or_default();
+                self.validate_options_for_owner(node);
                 for pattern in &patterns {
                     self.check_pattern_terms(*pattern, env);
                 }
@@ -1281,16 +1417,17 @@ impl<'a> SemanticChecker<'a> {
         }
     }
 
-    fn check_query_decl_options(&mut self, node: Node<'_>) {
-        let Some(options) = first_named_child_of_kind(node, "options") else {
+    fn validate_options_for_owner(&mut self, owner: Node<'_>) {
+        let Some(options) = first_named_child_of_kind(owner, "options") else {
             return;
         };
-        let Some(body) = node.child_by_field_name("body") else {
+        let Some(policy) = option_policy_for_owner(owner, self.source) else {
             return;
         };
-        if !contains_prefix_query_kind(body, "secret", self.source) {
-            return;
-        }
+        self.validate_allowed_options(options, policy);
+    }
+
+    fn validate_allowed_options(&mut self, options: Node<'_>, policy: OptionPolicy) {
         for option in options.named_children(&mut options.walk()) {
             if option.kind() != "identifier" {
                 continue;
@@ -1298,15 +1435,11 @@ impl<'a> SemanticChecker<'a> {
             let Some(name) = node_text(self.source, option) else {
                 continue;
             };
-            let valid = matches!(
-                name.as_str(),
-                "reachability" | "pv_reachability" | "real_or_random" | "pv_real_or_random"
-            ) || name.starts_with("cv_");
-            if !valid {
+            if !policy.allows(&name) {
                 self.diagnostics.push(Diagnostic {
                     range: range_from_node(self.source, option),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    message: "the allowed options for query secret are reachability, pv_reachability, real_or_random, pv_real_or_random, and options starting with cv_".into(),
+                    message: policy.error_message().to_owned(),
                     ..Diagnostic::default()
                 });
             }
@@ -2442,6 +2575,18 @@ fn first_named_descendant_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node
     None
 }
 
+fn option_policy_for_owner(owner: Node<'_>, source: &str) -> Option<OptionPolicy> {
+    match owner.kind() {
+        "free_decl" => Some(OptionPolicy::FreeName),
+        "in_process" | "get_process" => Some(OptionPolicy::ProcessInputGet),
+        "query_decl" => owner
+            .child_by_field_name("body")
+            .filter(|body| contains_prefix_query_kind(*body, "secret", source))
+            .map(|_| OptionPolicy::QuerySecret),
+        _ => None,
+    }
+}
+
 fn contains_prefix_query_kind(node: Node<'_>, prefix: &str, source: &str) -> bool {
     if node.kind() == "prefix_query" {
         return leading_keyword(source, node).as_deref() == Some(prefix);
@@ -2558,30 +2703,14 @@ fn snippet_for_node(source: &str, node: Node<'_>) -> String {
         .unwrap_or_else(|| node.kind().to_owned())
 }
 
-fn completion_kind_for_symbol(kind: SymbolKind) -> CompletionItemKind {
-    match kind {
-        SymbolKind::Type => CompletionItemKind::CLASS,
-        SymbolKind::Function => CompletionItemKind::FUNCTION,
-        SymbolKind::Constant => CompletionItemKind::CONSTANT,
-        SymbolKind::Variable => CompletionItemKind::VARIABLE,
-    }
-}
-
-fn completion_detail_for_symbol(kind: SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Type => "type",
-        SymbolKind::Function => "function",
-        SymbolKind::Constant => "constant",
-        SymbolKind::Variable => "variable",
-    }
-}
-
 fn completion_item_priority(item: &CompletionItem) -> u8 {
     match item.detail.as_deref() {
         Some("constant") => 0,
         Some("variable") => 1,
         Some("function") => 2,
+        Some("event") | Some("predicate") | Some("table") | Some("process") => 2,
         Some("type") => 3,
+        Some("option") => 4,
         _ if item.kind == Some(CompletionItemKind::KEYWORD) => 10,
         _ => 5,
     }
@@ -2606,13 +2735,6 @@ fn is_completion_prefix_char(ch: char) -> bool {
 
 fn matches_prefix(candidate: &str, prefix: &str) -> bool {
     prefix.is_empty() || candidate.starts_with(prefix)
-}
-
-fn should_offer_named_symbols(prefix: &str) -> bool {
-    prefix
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '@')
 }
 
 fn range_from_node(source: &str, node: Node<'_>) -> LspRange {
@@ -2961,6 +3083,22 @@ query putbegin event:e, missing.
     }
 
     #[test]
+    fn checks_invalid_free_and_process_options() {
+        let source = r#"
+free k: bitstring [kokona].
+free c: channel.
+process in(c, x) [bad]
+"#;
+        let messages = messages(source);
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("for free names, the only allowed option is private")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("process input and get can only have \"precise\" as option")));
+    }
+
+    #[test]
     fn rejects_special_query_forms_in_lemmas_and_bare_phase_queries() {
         let source = r#"
 free c: channel.
@@ -3045,5 +3183,38 @@ query attacker(i).
             .position(|item| item.kind == Some(CompletionItemKind::KEYWORD))
             .expect("keyword suggestion");
         assert!(symbol_idx < keyword_idx);
+    }
+
+    #[test]
+    fn completion_suggests_private_option_for_free_names() {
+        let labels = completion_labels("free k: bitstring [pri].", Position::new(0, 21));
+        assert!(labels.iter().any(|label| label == "private"));
+    }
+
+    #[test]
+    fn completion_suggests_declared_events() {
+        let source = r#"
+event begin(bitstring).
+query inj-event(be).
+"#;
+        let items = completion_items(source, Position::new(2, 17));
+        let event = items.iter().find(|item| item.label == "begin").expect("event suggestion");
+        assert_eq!(event.detail.as_deref(), Some("event"));
+    }
+
+    #[test]
+    fn completion_suggests_bound_variables() {
+        let source = r#"
+free c: channel.
+let p =
+  in(c, x:bitstring);
+  out(c, x).
+"#;
+        let items = completion_items(source, Position::new(4, 9));
+        let variable = items
+            .iter()
+            .find(|item| item.label == "x")
+            .expect("bound variable suggestion");
+        assert_eq!(variable.detail.as_deref(), Some("variable"));
     }
 }
