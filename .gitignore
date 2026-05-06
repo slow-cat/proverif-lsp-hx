@@ -1,2 +1,5 @@
 /target
 /runtime
+build
+*.so
+*.o
