@@ -4,13 +4,13 @@ use crate::documents::DocumentStore;
 use crate::syntax;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    Diagnostic, DiagnosticOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, FullDocumentDiagnosticReport, Hover, HoverContents,
-    HoverParams, InitializeParams, InitializeResult, InitializedParams, MarkupContent, MarkupKind,
-    MessageType, RelatedFullDocumentDiagnosticReport, ServerCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind,
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticOptions,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    FullDocumentDiagnosticReport, Hover, HoverContents, HoverParams, InitializeParams,
+    InitializeResult, InitializedParams, MarkupContent, MarkupKind, MessageType,
+    RelatedFullDocumentDiagnosticReport, ServerCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -119,23 +119,18 @@ impl LanguageServer for Backend {
         Ok(hover)
     }
 
-    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let keywords = [
-            "type", "fun", "reduc", "equation", "const", "free", "event", "pred", "table", "let",
-            "letfun", "set", "query", "process", "new", "in", "out", "if", "then", "else",
-            "forall",
-        ];
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(doc) = self.documents.get(&uri) else {
+            return Ok(None);
+        };
 
-        Ok(Some(CompletionResponse::Array(
-            keywords
-                .into_iter()
-                .map(|label| CompletionItem {
-                    label: label.to_owned(),
-                    kind: Some(CompletionItemKind::KEYWORD),
-                    ..CompletionItem::default()
-                })
-                .collect(),
-        )))
+        let items = syntax::parse(&doc.text)
+            .map(|parsed| parsed.completion_items(position))
+            .unwrap_or_default();
+
+        Ok(Some(CompletionResponse::Array(items)))
     }
 
     async fn diagnostic(

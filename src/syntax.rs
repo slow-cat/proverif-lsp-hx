@@ -4,7 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use anyhow::{Context, Result};
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range as LspRange};
+use crate::keywords::KEYWORD_CANDIDATES;
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, Position,
+    Range as LspRange,
+};
 use tree_sitter::{
     Language, Node, Parser, Point, Query, QueryCapture, QueryCursor, StreamingIterator, Tree,
 };
@@ -24,6 +28,9 @@ pub enum SymbolKind {
     Constant,
     Variable,
 }
+
+const BUILTIN_TYPE_NAMES: &[&str] = &["bitstring", "channel", "bool", "nat"];
+const BUILTIN_FUNCTION_NAMES: &[&str] = &["true", "false", "not"];
 
 pub struct ParsedDocument {
     tree: Tree,
@@ -112,6 +119,120 @@ impl ParsedDocument {
         self.symbols().ok()?.into_iter().find(|symbol| {
             symbol.selection_range.start <= offset && offset <= symbol.selection_range.end
         })
+    }
+
+    pub fn completion_items(&self, position: Position) -> Vec<CompletionItem> {
+        let prefix = completion_prefix(&self.source, position).unwrap_or_default();
+        let mut labels = HashSet::new();
+        let mut items = Vec::new();
+        let mut expects_identifier = false;
+
+        if let Some(node) = self.node_at(position) {
+            let state = offset_for_position(&self.source, position)
+                .map(|offset| {
+                    if node.start_byte() <= offset && offset < node.end_byte() {
+                        node.parse_state()
+                    } else {
+                        node.next_parse_state()
+                    }
+                })
+                .unwrap_or_else(|| node.next_parse_state());
+            if let Some(mut lookahead) = language().lookahead_iterator(state) {
+                for symbol_name in lookahead.iter_names() {
+                    if symbol_name == "identifier" {
+                        expects_identifier = true;
+                        continue;
+                    }
+                    if !KEYWORD_CANDIDATES.contains(&symbol_name) {
+                        continue;
+                    }
+                    if !matches_prefix(symbol_name, &prefix) || !labels.insert(symbol_name.to_owned()) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: symbol_name.to_owned(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        ..CompletionItem::default()
+                    });
+                }
+            }
+        }
+
+        if expects_identifier || should_offer_named_symbols(&prefix) {
+            for (name, kind) in self.completion_symbol_entries() {
+                if !matches_prefix(&name, &prefix) || !labels.insert(name.clone()) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: name,
+                    kind: Some(completion_kind_for_symbol(kind)),
+                    detail: Some(completion_detail_for_symbol(kind).to_owned()),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        if items.is_empty() {
+            for keyword in KEYWORD_CANDIDATES {
+                if !matches_prefix(keyword, &prefix) || !labels.insert((*keyword).to_owned()) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: (*keyword).to_owned(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        items.sort_by(|left, right| {
+            completion_item_priority(left)
+                .cmp(&completion_item_priority(right))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        items
+    }
+
+    fn completion_symbol_entries(&self) -> Vec<(String, SymbolKind)> {
+        let mut entries = Vec::new();
+        let mut labels = HashSet::new();
+        let globals = self.globals_for_completion();
+
+        for name in globals.types {
+            if labels.insert(name.clone()) {
+                entries.push((name, SymbolKind::Type));
+            }
+        }
+        for (name, _) in globals.functions {
+            if labels.insert(name.clone()) {
+                entries.push((name, SymbolKind::Function));
+            }
+        }
+        for (name, _) in globals.names {
+            if labels.insert(name.clone()) {
+                entries.push((name, SymbolKind::Constant));
+            }
+        }
+        for symbol in self
+            .symbols()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Variable)
+        {
+            if labels.insert(symbol.name.clone()) {
+                entries.push((symbol.name, SymbolKind::Variable));
+            }
+        }
+
+        entries
+    }
+
+    fn globals_for_completion(&self) -> GlobalEnv {
+        let mut checker = SemanticChecker::new(&self.source);
+        let root = self.tree.root_node();
+        checker.collect_types(root);
+        checker.collect_globals(root);
+        checker.globals
     }
 
     fn semantic_diagnostics(&self) -> Result<Vec<Diagnostic>> {
@@ -210,7 +331,7 @@ impl<'a> SemanticChecker<'a> {
         let mut globals = GlobalEnv::default();
         globals
             .types
-            .extend(["bitstring", "channel", "bool", "nat"].into_iter().map(str::to_owned));
+            .extend(BUILTIN_TYPE_NAMES.iter().map(|name| (*name).to_owned()));
 
         globals.functions.insert(
             "true".into(),
@@ -2437,6 +2558,63 @@ fn snippet_for_node(source: &str, node: Node<'_>) -> String {
         .unwrap_or_else(|| node.kind().to_owned())
 }
 
+fn completion_kind_for_symbol(kind: SymbolKind) -> CompletionItemKind {
+    match kind {
+        SymbolKind::Type => CompletionItemKind::CLASS,
+        SymbolKind::Function => CompletionItemKind::FUNCTION,
+        SymbolKind::Constant => CompletionItemKind::CONSTANT,
+        SymbolKind::Variable => CompletionItemKind::VARIABLE,
+    }
+}
+
+fn completion_detail_for_symbol(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Type => "type",
+        SymbolKind::Function => "function",
+        SymbolKind::Constant => "constant",
+        SymbolKind::Variable => "variable",
+    }
+}
+
+fn completion_item_priority(item: &CompletionItem) -> u8 {
+    match item.detail.as_deref() {
+        Some("constant") => 0,
+        Some("variable") => 1,
+        Some("function") => 2,
+        Some("type") => 3,
+        _ if item.kind == Some(CompletionItemKind::KEYWORD) => 10,
+        _ => 5,
+    }
+}
+
+fn completion_prefix(source: &str, position: Position) -> Option<String> {
+    let offset = offset_for_position(source, position)?;
+    let mut chars = Vec::new();
+    for ch in source[..offset].chars().rev() {
+        if !is_completion_prefix_char(ch) {
+            break;
+        }
+        chars.push(ch);
+    }
+    chars.reverse();
+    Some(chars.into_iter().collect())
+}
+
+fn is_completion_prefix_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\'' | '-' | '@')
+}
+
+fn matches_prefix(candidate: &str, prefix: &str) -> bool {
+    prefix.is_empty() || candidate.starts_with(prefix)
+}
+
+fn should_offer_named_symbols(prefix: &str) -> bool {
+    prefix
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '@')
+}
+
 fn range_from_node(source: &str, node: Node<'_>) -> LspRange {
     let start = position_from_offset(source, node.start_byte());
     let end = position_from_offset(source, node.end_byte());
@@ -2500,6 +2678,7 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::parse;
+    use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position};
 
     fn messages(source: &str) -> Vec<String> {
         parse(source)
@@ -2508,6 +2687,21 @@ mod tests {
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect()
+    }
+
+    fn completion_labels(source: &str, position: Position) -> Vec<String> {
+        parse(source)
+            .expect("parse source")
+            .completion_items(position)
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    fn completion_items(source: &str, position: Position) -> Vec<CompletionItem> {
+        parse(source)
+            .expect("parse source")
+            .completion_items(position)
     }
 
     #[test]
@@ -2781,5 +2975,75 @@ query phase 1.
         assert!(messages
             .iter()
             .any(|message| message.contains("phase can only be used with attacker, mess, or table")));
+    }
+
+    #[test]
+    fn completion_uses_lookahead_for_top_level_keywords() {
+        let labels = completion_labels("", Position::new(0, 0));
+        assert!(labels.iter().any(|label| label == "type"));
+        assert!(labels.iter().any(|label| label == "query"));
+    }
+
+    #[test]
+    fn completion_suggests_declared_identifiers_when_expected() {
+        let source = r#"
+type nonce.
+const secret: nonce.
+query attacker(sec).
+"#;
+        let labels = completion_labels(source, Position::new(3, 18));
+        assert!(labels.iter().any(|label| label == "secret"));
+    }
+
+    #[test]
+    fn completion_suggests_builtin_types_for_type_positions() {
+        let labels = completion_labels("free c:chan.", Position::new(0, 11));
+        assert!(labels.iter().any(|label| label == "channel"));
+    }
+
+    #[test]
+    fn completion_classifies_declared_symbols() {
+        let source = r#"
+type nonce.
+fun hash(nonce): nonce.
+const secret: nonce.
+set flag = true.
+query attacker().
+"#;
+        let items = completion_items(source, Position::new(5, 15));
+
+        let ty = items.iter().find(|item| item.label == "nonce").expect("type suggestion");
+        assert_eq!(ty.kind, Some(CompletionItemKind::CLASS));
+        assert_eq!(ty.detail.as_deref(), Some("type"));
+
+        let fun = items.iter().find(|item| item.label == "hash").expect("function suggestion");
+        assert_eq!(fun.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(fun.detail.as_deref(), Some("function"));
+
+        let cst = items.iter().find(|item| item.label == "secret").expect("constant suggestion");
+        assert_eq!(cst.kind, Some(CompletionItemKind::CONSTANT));
+        assert_eq!(cst.detail.as_deref(), Some("constant"));
+
+        let var = items.iter().find(|item| item.label == "flag").expect("variable suggestion");
+        assert_eq!(var.kind, Some(CompletionItemKind::VARIABLE));
+        assert_eq!(var.detail.as_deref(), Some("variable"));
+    }
+
+    #[test]
+    fn completion_prioritizes_declared_symbols_over_keywords() {
+        let source = r#"
+type input_tag.
+query attacker(i).
+"#;
+        let items = completion_items(source, Position::new(2, 16));
+        let symbol_idx = items
+            .iter()
+            .position(|item| item.label == "input_tag")
+            .expect("symbol suggestion");
+        let keyword_idx = items
+            .iter()
+            .position(|item| item.kind == Some(CompletionItemKind::KEYWORD))
+            .expect("keyword suggestion");
+        assert!(symbol_idx < keyword_idx);
     }
 }

@@ -1,5 +1,6 @@
 mod backend;
 mod documents;
+mod keywords;
 mod syntax;
 
 use anyhow::Result;
