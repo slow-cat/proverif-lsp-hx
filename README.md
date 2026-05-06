@@ -15,5 +15,5 @@ Useful commands:
 
 - `make build` for Rust build + runtime artifacts
 - `make check` for Rust build checks
-- `make ts-generate` to regenerate parser sources from `grammar.js`
+- `make ts-generate` to regenerate parser sources from `grammar.js`, depending `treesitter-cli`
 - `make runtime` to build `proverif.so` and copy it (plus `highlights.scm`) into `./runtime/`

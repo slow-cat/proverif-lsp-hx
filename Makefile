@@ -31,7 +31,7 @@ check:
 	cargo check
 
 ts-generate:
-	cd "$(TREE_SITTER_DIR)" && ./node_modules/.bin/tree-sitter generate
+	cd "$(TREE_SITTER_DIR)" && tree-sitter generate
 
 ts-build:
 	mkdir -p "$(RUNTIME_GRAMMARS_DIR)" "$(TREE_SITTER_BUILD_DIR)"
