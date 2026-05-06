@@ -1,0 +1,20 @@
+[package]
+name = "proverif-lsp-hx"
+version = "0.1.0"
+edition = "2021"
+[[bin]]
+name = "proverif-lsp-rs"
+path = "src/main.rs"
+[dependencies]
+anyhow = "1.0"
+dashmap = "6.1"
+tokio = { version = "1.48", features = ["full"] }
+tower-lsp = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.25"
+url = "2.5"
+
+[build-dependencies]
+cc = "1.1"
+

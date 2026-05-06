@@ -1,0 +1,15 @@
+[language-server.proverif-lsp]
+command="path-to-/target/release/proverif-lsp-rs"
+
+[[language]]
+name = "proverif"
+scope = "source.pv"
+file-types = ["pv", "pvl", "pcv"]
+language-servers = ["typos","proverif-lsp"]
+grammar = "proverif"
+block-comment-tokens ={start="(*",end="*)"}
+[auto-pairs]
+"(*"="*)"
+[[grammar]]
+name = "proverif"
+source = { path = "path-to-/tree-sitter-proverif" }

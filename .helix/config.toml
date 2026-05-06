@@ -1,0 +1,5 @@
+[keys.normal]
+A-r=":sh proverif %{buffer_name}"
+[editor.inline-diagnostics]
+cursor-line = "hint"
+

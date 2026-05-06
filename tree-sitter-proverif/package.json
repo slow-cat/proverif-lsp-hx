@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-proverif",
+  "version": "0.1.0",
+  "private": true,
+  "main": "grammar.js",
+  "scripts": {
+    "generate": "tree-sitter generate"
+  }
+}
